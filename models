@@ -1,0 +1,59 @@
+import torch
+import torch.nn as nn
+
+
+class PolicyNetwork(nn.Module):
+    def __init__(self, state_dim=88, hidden_dim=256):
+        super().__init__()
+        self.state_norm = nn.LayerNorm(state_dim)
+
+        self.mass_flow_net = self._create_network(state_dim, hidden_dim, 4)
+        self.temp_net = self._create_network(state_dim, hidden_dim, 4)
+
+        self.mass_flow_ranges = torch.tensor([0.717, 1.434, 0.956, 1.195])
+        self.temp_range = (278.15, 290.15)
+
+    def _create_network(self, input_dim, hidden_dim, output_dim):
+        return nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, states):
+        x = self.state_norm(states)
+
+        mass_flows = self.mass_flow_net(x) * self.mass_flow_ranges.to(x.device)
+        temps = self.temp_net(x) * (self.temp_range[1] - self.temp_range[0]) + self.temp_range[0]
+
+        actions = torch.zeros(states.shape[0], 8).to(x.device)
+        actions[:, ::2] = mass_flows
+        actions[:, 1::2] = temps
+
+        return actions
+
+
+class RewardNetwork(nn.Module):
+    def __init__(self, state_dim=88, hidden_dim=256):
+        super().__init__()
+        self.state_norm = nn.LayerNorm(state_dim)
+
+        self.network = nn.Sequential(
+            nn.Linear(state_dim + 8, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, states, actions):
+        states = self.state_norm(states)
+        x = torch.cat([states, actions], dim=1)
+        return self.network(x)
