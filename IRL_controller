@@ -1,0 +1,186 @@
+import sys
+import torch
+import numpy as np
+from pathlib import Path
+import json
+import matplotlib.pyplot as plt
+from env import MultipleHPCooling
+from models import PolicyNetwork
+import pandas as pd
+import os
+
+
+class IRLController:
+    """Combined IRL Controller for both evaluation and deployment."""
+
+    def __init__(self, config, test_mode=False):
+        """Initialize IRL Controller"""
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+
+        self.project_root = Path("D:/DOCUMENT/polito/polito/source/Thesis/code/coordinated_hp_thesis_zaregarizi")
+        self.config = config
+        self.test_mode = test_mode
+
+        # Load model and normalization stats
+        self.setup_models()
+        self.load_norm_stats()
+
+    def setup_models(self):
+        """Load and setup the policy network"""
+        try:
+            print("Setting up neural network...")
+            self.policy_net = PolicyNetwork().to(self.device)
+
+            models_dir = self.project_root / "data" / "result" / "irl" / "trained_models"
+            policy_path = models_dir / "policy_net_best.pth"
+
+            if not policy_path.exists():
+                raise FileNotFoundError(f"Policy model not found at {policy_path}")
+
+            print(f"Loading policy from: {policy_path}")
+            self.policy_net.load_state_dict(
+                torch.load(policy_path, map_location=self.device, weights_only=True)
+            )
+            self.policy_net.eval()
+            print("Model loaded successfully")
+
+        except Exception as e:
+            print(f"Error setting up model: {e}")
+            raise
+
+    def load_norm_stats(self):
+        """Load state normalization statistics"""
+        try:
+            stats_path = self.project_root / "data" / "result" / "irl" / "normalization_stats.npz"
+            if not stats_path.exists():
+                raise FileNotFoundError(f"Normalization stats not found at {stats_path}")
+
+            print(f"Loading normalization stats from: {stats_path}")
+            stats = np.load(stats_path)
+            self.state_mean = stats['mean']
+            self.state_std = stats['std']
+            print("Normalization stats loaded successfully")
+
+        except Exception as e:
+            print(f"Error loading normalization stats: {e}")
+            raise
+
+    def normalize_state(self, state):
+        """Normalize state using stored statistics"""
+        return (state - self.state_mean) / self.state_std
+
+    def get_action(self, state):
+        """Get action from policy network"""
+        norm_state = self.normalize_state(state)
+        state_tensor = torch.FloatTensor(norm_state).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            action = self.policy_net(state_tensor)
+
+        return action.squeeze(0).cpu().numpy()
+
+    def run_episode(self):
+        """Run a single episode"""
+        original_dir = os.getcwd()
+
+        try:
+            # Change to project root directory
+            os.chdir(self.project_root)
+
+            # Initialize and run environment
+            env = MultipleHPCooling(self.config, test_mode=self.test_mode)
+            state = env.reset()
+            done = False
+            step = 0
+
+            print("\nRunning IRL control...")
+            while not done:
+                # Get and format action
+                raw_action = self.get_action(state)
+                formatted_action = []
+                for i in range(0, len(raw_action), 2):
+                    formatted_action.append([raw_action[i], raw_action[i + 1]])
+
+                # Take step in environment
+                next_state, reward, done, info = env.step(formatted_action)
+                state = next_state
+                step += 1
+
+                # Daily progress
+                if env.simulation_index % 86400 == 0:
+                    print(f"Day {env.simulation_index // 86400}: Cost = {env.episode_cost:.2f}")
+
+            # Collect results
+            results = {
+                'cost': env.episode_cost,
+                'self_sufficiency': env.self_sufficiency,
+                'self_consumption': env.self_consumption,
+                'steps': step
+            }
+
+            print(f"\nResults:")
+            print(f"Total Cost: {results['cost']:.2f}")
+            print(f"Self Sufficiency: {results['self_sufficiency']:.2f}%")
+            print(f"Self Consumption: {results['self_consumption']:.2f}%")
+
+            return results
+
+        finally:
+            os.chdir(original_dir)
+
+
+def main():
+    try:
+        project_root = Path("D:/DOCUMENT/polito/polito/source/Thesis/code/coordinated_hp_thesis_zaregarizi")
+        config_path = project_root / "sim_config" / "config0.json"
+
+        print("Starting IRL Controller...")
+
+        # Load config
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+
+        # Set control type to IRL
+        config['control_type'] = 'irl'
+
+        # Update paths in config to be absolute
+        path_keys = ['weather_path', 'fmu_path', 'fmu_weather_path', 'pv_path',
+                     'price_path', 'time_variables_path', 'cooling_load_dir_path']
+        for key in path_keys:
+            config[key] = str(project_root / config[key])
+
+        # Set result paths
+        config['result_path'] = str(project_root / "data" / "result" / "irl")
+        config['cop_curves_path'] = str(project_root / "data" / "cop_curves")
+
+        # Run controller
+        controller = IRLController(config, test_mode=True)
+        results = controller.run_episode()
+
+        # Save results
+        results_df = pd.DataFrame(
+            [[config['test_number'], results['cost'],
+              results['self_sufficiency'], results['self_consumption']]],
+            columns=['Test number', 'Electricity cost', 'Self sufficiency', 'Self consumption']
+        )
+
+        results_file = project_root / "data" / "result" / "summary_irl_trials.csv"
+        if not results_file.exists():
+            results_df.to_csv(results_file, index=False)
+        else:
+            existing_results = pd.read_csv(results_file)
+            updated_results = pd.concat([existing_results, results_df])
+            updated_results.to_csv(results_file, index=False)
+
+        print(f"\nResults saved to summary_irl_trials.csv")
+        print("Execution completed successfully")
+
+    except Exception as e:
+        print(f"\nError occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
