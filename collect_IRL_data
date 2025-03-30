@@ -1,0 +1,190 @@
+import numpy as np
+from pathlib import Path
+import json
+import os
+from env import MultipleHPCooling
+from controllers.rbc import RBCController
+import sys
+
+
+class IRLDataCollector:
+    def __init__(self):
+        """Initialize the IRL Data Collector"""
+        # Setup paths
+        self.project_root = Path.cwd().parent
+        self.config_path = self.project_root / "sim_config" / "config0.json"
+
+        print(f"Loading config from: {self.config_path}")
+
+        # Store original working directory
+        self.original_dir = os.getcwd()
+
+        # Load configuration
+        with open(self.config_path, 'r') as f:
+            self.config = json.load(f)
+
+        # Important: Add control_type to config
+        self.config['control_type'] = 'rbc'  # Set to rbc for Rule-Based Control
+        print(f"Set control type to: {self.config['control_type']}")
+
+        # Update all paths in config to be absolute
+        self.config['weather_path'] = str(self.project_root / self.config['weather_path'])
+        self.config['fmu_path'] = str(self.project_root / self.config['fmu_path'])
+        self.config['fmu_weather_path'] = str(self.project_root / self.config['fmu_weather_path'])
+        self.config['pv_path'] = str(self.project_root / self.config['pv_path'])
+        self.config['price_path'] = str(self.project_root / self.config['price_path'])
+        self.config['time_variables_path'] = str(self.project_root / self.config['time_variables_path'])
+        self.config['cooling_load_dir_path'] = str(self.project_root / self.config['cooling_load_dir_path'])
+
+        # Create IRL results directory
+        self.irl_data_dir = self.project_root / "data" / "result" / "irl"
+        self.irl_data_dir.mkdir(parents=True, exist_ok=True)
+        self.config['result_path'] = str(self.irl_data_dir)
+
+        # Verify cop_curves directory
+        self.cop_curves_dir = self.project_root / "data" / "cop_curves"
+        print(f"\nChecking paths:")
+        print(f"COP curves directory: {self.cop_curves_dir}")
+        for building_id in self.config['building_list']:
+            cop_curve_name = self.config['init_params'][building_id]['cop_curve_name']
+            cop_curve_path = self.cop_curves_dir / f"{cop_curve_name}.json"
+            print(f"COP curve for {building_id}: {cop_curve_path} {'✓' if cop_curve_path.exists() else '✗'}")
+
+        # Change working directory to project root for relative paths
+        os.chdir(self.project_root)
+        print(f"\nWorking directory changed to: {os.getcwd()}")
+
+    def __del__(self):
+        """Restore original working directory when object is destroyed"""
+        try:
+            os.chdir(self.original_dir)
+            print(f"Working directory restored to: {os.getcwd()}")
+        except:
+            pass
+
+    def collect_expert_demonstrations(self, n_episodes=1):
+        """Collect expert demonstrations using RBC"""
+        print(f"\nCollecting {n_episodes} episodes of expert demonstrations...")
+
+        try:
+            # Initialize environment and storage
+            print("Initializing environment...")
+            env = MultipleHPCooling(self.config)
+            all_states = []
+            all_actions = []
+            all_rewards = []
+
+            # Initialize RBC controllers
+            print("Initializing RBC controllers...")
+            controllers = []
+            for building_id in self.config['building_list']:
+                print(f"Setting up controller for {building_id}")
+                t_tank_range = [7 + 273.15, 17 + 273.15]
+                swt_range = [4 + 273.15, 15 + 273.15]
+                t_out_range = [20, 30]
+                design_mass_flow_rate = self.config['init_params'][building_id]['m_1_input']
+                controller = RBCController(t_tank_range, swt_range, t_out_range,
+                                           design_mass_flow_rate, starting_control=0.0)
+                controllers.append(controller)
+
+            print("\nStarting data collection...")
+
+            # Collect demonstrations
+            for episode in range(n_episodes):
+                print(f"\nEpisode {episode + 1}/{n_episodes}")
+                print("Resetting environment...")
+                state = env.reset()
+                print(f"Initial state shape: {state.shape}")
+                done = False
+                step = 0
+
+                print("Starting episode steps...")
+                while not done:
+                    # Get actions from RBC controllers
+                    action_list = []
+                    for i, controller in enumerate(controllers):
+                        print(f"Getting action for building {i + 1}")
+                        print(f"Tank temperature: {env.tank_temperature_list[i]}")
+                        print(f"Outdoor temperature: {env.weather_data.loc[env.simulation_index - 3600]['t_out']}")
+                        action = controller.evaluate_action(
+                            env.tank_temperature_list[i],
+                            env.weather_data.loc[env.simulation_index - 3600]['t_out']
+                        )
+                        print(f"Action received: {action}")
+                        action_list.append(action)
+
+                    print(f"Taking step {step} with actions: {action_list}")
+                    # Take step in environment
+                    next_state, reward, done, _ = env.step(action_list)
+                    print(f"Step result - Reward: {reward}, Done: {done}")
+
+                    # Store transition
+                    all_states.append(state)
+                    all_actions.append(action_list)
+                    all_rewards.append(reward)
+
+                    state = next_state
+                    step += 1
+
+                    # Print daily progress
+                    if env.simulation_index % 86400 == 0:
+                        print(f"Day {int(env.simulation_index / 86400)}, "
+                              f"Cost: {env.episode_cost:.2f}, "
+                              f"Reward: {env.episode_reward:.2f}")
+
+                print(f"Episode {episode + 1} completed:")
+                print(f"Total steps: {step}")
+                print(f"Total Cost: {env.episode_cost:.2f}")
+                print(f"Self Sufficiency: {env.self_sufficiency:.2f}%")
+
+            # Save demonstrations
+            save_path = self.irl_data_dir / "expert_demonstrations.npz"
+            demonstrations = {
+                'states': np.array(all_states),
+                'actions': np.array(all_actions),
+                'rewards': np.array(all_rewards)
+            }
+
+            np.savez(save_path, **demonstrations)
+            print(f"\nDemonstrations saved to {save_path}")
+
+            return demonstrations
+
+        except Exception as e:
+            print(f"\nError in collect_expert_demonstrations: {str(e)}")
+            print("\nTraceback:")
+            import traceback
+            traceback.print_exc()
+            raise
+
+
+if __name__ == "__main__":
+    print("Starting IRL data collection...")
+    try:
+        collector = IRLDataCollector()
+        print("\nProject structure:")
+        print(f"Current directory: {os.getcwd()}")
+        print(f"Project root: {collector.project_root}")
+        print(f"Python path: {sys.path}")
+
+        # Print available directories
+        print("\nAvailable directories:")
+        for item in collector.project_root.glob("*"):
+            if item.is_dir():
+                print(f"  {item.name}/")
+
+        # Collect demonstrations
+        demonstrations = collector.collect_expert_demonstrations(n_episodes=1)
+        print(f"\nCollection completed:")
+        print(f"Collected {len(demonstrations['states'])} transitions")
+        print(f"State shape: {demonstrations['states'].shape}")
+        print(f"Action shape: {demonstrations['actions'].shape}")
+
+    except Exception as e:
+        print(f"\nError occurred: {str(e)}")
+        print("\nDebug Information:")
+        print(f"Current working directory: {os.getcwd()}")
+        print(f"Config contents:", collector.config if 'collector' in locals() else "Collector not initialized")
+        import traceback
+
+        traceback.print_exc()
