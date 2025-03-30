@@ -1,0 +1,320 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from pathlib import Path
+import matplotlib.pyplot as plt
+import pandas as pd
+
+
+class PolicyNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim):
+        super().__init__()
+        self.state_norm = nn.LayerNorm(state_dim)
+
+        # Mass flow network (4 buildings)
+        self.mass_flow_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 4),  # 4 mass flow rates
+            nn.Sigmoid()  # Output between 0 and 1
+        )
+
+        # Temperature network (4 buildings)
+        self.temp_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 4),  # 4 temperatures
+            nn.Sigmoid()  # Output between 0 and 1
+        )
+
+    def forward(self, states):
+        x = self.state_norm(states)
+
+        # Get raw outputs
+        mass_flows = self.mass_flow_net(x)
+        temps = self.temp_net(x)
+
+        # Scale mass flows to actual ranges
+        mass_flow_ranges = torch.tensor([0.717, 1.434, 0.956, 1.195]).to(x.device)
+        scaled_mass_flows = mass_flows * mass_flow_ranges
+
+        # Scale temperatures
+        temp_min, temp_max = 278.15, 290.15
+        scaled_temps = temps * (temp_max - temp_min) + temp_min
+
+        # Combine outputs
+        batch_size = states.shape[0]
+        actions = torch.zeros(batch_size, 8).to(x.device)
+        actions[:, ::2] = scaled_mass_flows  # Even indices
+        actions[:, 1::2] = scaled_temps  # Odd indices
+
+        return actions
+
+
+class RewardNetwork(nn.Module):
+    def __init__(self, state_dim, hidden_dim):
+        super().__init__()
+        self.state_norm = nn.LayerNorm(state_dim)
+
+        self.network = nn.Sequential(
+            nn.Linear(state_dim + 8, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, states, actions):
+        states = self.state_norm(states)
+        x = torch.cat([states, actions], dim=1)
+        return self.network(x)
+
+
+class IRL:
+    def __init__(self, state_dim=88, action_dim=8, hidden_dim=256):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+
+        # Initialize networks
+        self.policy_net = PolicyNetwork(state_dim, action_dim, hidden_dim).to(self.device)
+        self.reward_net = RewardNetwork(state_dim, hidden_dim).to(self.device)
+
+        # Initialize optimizers with smaller learning rates
+        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-4)
+        self.reward_optimizer = optim.Adam(self.reward_net.parameters(), lr=1e-4)
+
+        # Load and preprocess demonstrations
+        self.expert_demos = self.load_demonstrations()
+
+        # Initialize tracking metrics
+        self.train_losses = {
+            'policy': [], 'reward': [], 'validation': [],
+            'mass_flow_rmse': [], 'temp_rmse': [],
+            'mass_flow_mape': [], 'temp_mape': []
+        }
+
+    def load_demonstrations(self):
+        project_root = Path.cwd().parent
+        demo_path = project_root / "data" / "result" / "irl" / "expert_demonstrations.npz"
+        data = dict(np.load(demo_path))
+
+        actions = data['actions']
+        flat_actions = np.zeros((len(actions), 8))
+        for i, action_list in enumerate(actions):
+            for j, (mass_flow, temp) in enumerate(action_list):
+                flat_actions[i, j * 2] = mass_flow
+                flat_actions[i, j * 2 + 1] = temp
+
+        data['actions'] = flat_actions
+
+        print(f"State shape: {data['states'].shape}")
+        print(f"Action shape: {data['actions'].shape}")
+        return data
+
+    def normalize_expert_data(self):
+        states = self.expert_demos['states'].astype(np.float32)
+        self.state_mean = states.mean(axis=0).astype(np.float32)
+        self.state_std = states.std(axis=0).astype(np.float32) + 1e-8
+        normalized_states = (states - self.state_mean) / self.state_std
+
+        # Save normalization statistics
+        save_dir = Path.cwd().parent / "data" / "result" / "irl"
+        stats_path = save_dir / "normalization_stats.npz"
+        np.savez(stats_path, mean=self.state_mean, std=self.state_std)
+        print(f"Normalization statistics saved to: {stats_path}")
+
+        return {
+            'states': normalized_states.astype(np.float32),
+            'actions': self.expert_demos['actions'].astype(np.float32)
+        }
+
+    def calculate_metrics(self, predicted, expert):
+        if torch.is_tensor(predicted):
+            predicted = predicted.cpu().detach().numpy()
+        if torch.is_tensor(expert):
+            expert = expert.cpu().detach().numpy()
+
+        # Split into mass flow and temperature
+        mass_flow_pred = predicted[:, ::2]
+        mass_flow_expert = expert[:, ::2]
+        temp_pred = predicted[:, 1::2]
+        temp_expert = expert[:, 1::2]
+
+        # Calculate RMSE
+        rmse = np.sqrt(np.mean((predicted - expert) ** 2))
+        mass_flow_rmse = np.sqrt(np.mean((mass_flow_pred - mass_flow_expert) ** 2))
+        temp_rmse = np.sqrt(np.mean((temp_pred - temp_expert) ** 2))
+
+        # Calculate MAPE with safety checks
+        def safe_mape(y_true, y_pred):
+            mask = np.abs(y_true) > 1e-7  # Avoid division by near-zero values
+            if mask.any():
+                return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+            return 0.0
+
+        mass_flow_mape = safe_mape(mass_flow_expert, mass_flow_pred)
+        temp_mape = safe_mape(temp_expert - 273.15, temp_pred - 273.15)  # Convert to Celsius for MAPE
+
+        return {
+            'rmse': rmse,
+            'mass_flow_rmse': mass_flow_rmse,
+            'temp_rmse': temp_rmse,
+            'mass_flow_mape': mass_flow_mape,
+            'temp_mape': temp_mape
+        }
+
+    def validate(self, samples=100):
+        with torch.no_grad():
+            indices = np.random.choice(len(self.expert_demos['states']), samples)
+            states = torch.FloatTensor(self.expert_demos['states'][indices]).to(self.device)
+            states = ((states - torch.FloatTensor(self.state_mean).to(self.device)) /
+                      torch.FloatTensor(self.state_std).to(self.device))
+            expert_actions = torch.FloatTensor(self.expert_demos['actions'][indices]).to(self.device)
+
+            predicted_actions = self.policy_net(states)
+            metrics = self.calculate_metrics(predicted_actions, expert_actions)
+            return metrics
+
+    def train(self, n_epochs=1000, batch_size=64):
+        print("\nStarting IRL training...")
+        normalized_demos = self.normalize_expert_data()
+
+        best_validation_loss = float('inf')
+        patience = 10
+        patience_counter = 0
+
+        metrics_history = []
+
+        for epoch in range(n_epochs):
+            # Training
+            indices = np.random.randint(0, len(normalized_demos['states']), batch_size)
+            states = torch.FloatTensor(normalized_demos['states'][indices]).to(self.device)
+            expert_actions = torch.FloatTensor(normalized_demos['actions'][indices]).to(self.device)
+
+            # Train policy
+            self.policy_optimizer.zero_grad()
+            predicted_actions = self.policy_net(states)
+            policy_loss = torch.mean((predicted_actions - expert_actions) ** 2)
+            policy_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+            self.policy_optimizer.step()
+
+            # Train reward
+            self.reward_optimizer.zero_grad()
+            expert_rewards = self.reward_net(states, expert_actions)
+            policy_rewards = self.reward_net(states, predicted_actions.detach())
+            reward_loss = -(torch.mean(expert_rewards) - torch.log(torch.mean(torch.exp(policy_rewards)) + 1e-8))
+            reward_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.reward_net.parameters(), 1.0)
+            self.reward_optimizer.step()
+
+            # Validation and logging
+            if (epoch + 1) % 10 == 0:
+                metrics = self.validate()
+
+                # Store metrics
+                self.train_losses['policy'].append(policy_loss.item())
+                self.train_losses['reward'].append(reward_loss.item())
+                self.train_losses['validation'].append(metrics['rmse'])
+                self.train_losses['mass_flow_rmse'].append(metrics['mass_flow_rmse'])
+                self.train_losses['temp_rmse'].append(metrics['temp_rmse'])
+                self.train_losses['mass_flow_mape'].append(metrics['mass_flow_mape'])
+                self.train_losses['temp_mape'].append(metrics['temp_mape'])
+
+                metrics_history.append({
+                    'epoch': epoch + 1,
+                    'policy_loss': policy_loss.item(),
+                    'reward_loss': reward_loss.item(),
+                    **metrics
+                })
+
+                print(f"\nEpoch {epoch + 1}/{n_epochs}")
+                print(f"Policy Loss: {policy_loss.item():.4f}")
+                print(f"Reward Loss: {reward_loss.item():.4f}")
+                print(f"Overall RMSE: {metrics['rmse']:.4f}")
+                print(f"Mass Flow - RMSE: {metrics['mass_flow_rmse']:.4f}, MAPE: {metrics['mass_flow_mape']:.2f}%")
+                print(f"Temperature - RMSE: {metrics['temp_rmse']:.4f}, MAPE: {metrics['temp_mape']:.2f}%")
+
+                if metrics['rmse'] < best_validation_loss:
+                    best_validation_loss = metrics['rmse']
+                    self.save_models('best')
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= patience:
+                    print("\nEarly stopping triggered")
+                    break
+
+        # Save training history
+        self.save_training_history(metrics_history)
+        self.plot_training_curves()
+        self.save_models('final')
+
+    def plot_training_curves(self):
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        fig.suptitle('Training Metrics')
+
+        # Plot losses
+        axes[0, 0].plot(self.train_losses['policy'], label='Policy Loss')
+        axes[0, 0].set_title('Policy Loss')
+        axes[0, 0].legend()
+
+        axes[0, 1].plot(self.train_losses['reward'], label='Reward Loss')
+        axes[0, 1].set_title('Reward Loss')
+        axes[0, 1].legend()
+
+        # Plot RMSE
+        axes[0, 2].plot(self.train_losses['validation'], label='Overall')
+        axes[0, 2].plot(self.train_losses['mass_flow_rmse'], label='Mass Flow')
+        axes[0, 2].plot(self.train_losses['temp_rmse'], label='Temperature')
+        axes[0, 2].set_title('RMSE')
+        axes[0, 2].legend()
+
+        # Plot MAPE
+        axes[1, 0].plot(self.train_losses['mass_flow_mape'], label='Mass Flow')
+        axes[1, 0].plot(self.train_losses['temp_mape'], label='Temperature')
+        axes[1, 0].set_title('MAPE (%)')
+        axes[1, 0].legend()
+
+        plt.tight_layout()
+        plt.savefig('training_curves.png')
+        plt.close()
+
+    def save_training_history(self, metrics_history):
+        df = pd.DataFrame(metrics_history)
+        save_dir = Path.cwd().parent / "data" / "result" / "irl"
+        df.to_csv(save_dir / "training_history.csv", index=False)
+        print(f"Training history saved to: {save_dir}/training_history.csv")
+
+    def save_models(self, suffix=''):
+        save_dir = Path.cwd().parent / "data" / "result" / "irl" / "trained_models"
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        torch.save(self.policy_net.state_dict(), save_dir / f"policy_net_{suffix}.pth")
+        torch.save(self.reward_net.state_dict(), save_dir / f"reward_net_{suffix}.pth")
+        print(f"Models saved with suffix: {suffix}")
+
+
+if __name__ == "__main__":
+    print("Starting IRL Training...")
+    try:
+        irl = IRL()
+        irl.train(n_epochs=1000, batch_size=64)
+        print("Training completed successfully")
+    except Exception as e:
+        print(f"Error occurred: {str(e)}")
+        import traceback
+
+        traceback.print_exc()
