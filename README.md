@@ -32,6 +32,7 @@ Once the reward function is recovered, it is used to train a control policy that
 ---
 
 ## Key Features
+<img width="1090" height="521" alt="image" src="https://github.com/user-attachments/assets/393e3b40-9838-487e-a84e-abff06e371a6" />
 
 | Feature | Description |
 |---|---|
